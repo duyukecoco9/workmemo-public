@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { readFile, writeFile, mkdir, copyFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import os from 'node:os';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +12,14 @@ const PORT = process.env.PORT || 8848;
 const AI_TARGET = (process.env.AI_TARGET || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
 const ACCESS_CODE = process.env.WORKMEMO_ACCESS_CODE || 'workmemo';
 const SESSION_SECRET = process.env.WORKMEMO_SESSION_SECRET || 'workmemo-session:' + ACCESS_CODE;
+const ACCESS_SPACES = (() => {
+  const raw = process.env.WORKMEMO_ACCESS_CODES;
+  if (!raw) return new Map([[ACCESS_CODE, 'default']]);
+  try {
+    const parsed = JSON.parse(raw);
+    return new Map(Object.entries(parsed).map(([code, space]) => [String(code), String(space || 'default')]));
+  } catch { return new Map([[ACCESS_CODE, 'default']]); }
+})();
 const PANORAMA_PATH = process.env.PANORAMA_PATH || '/Users/julianhuang/Documents/Kimi/Workspaces/DIP/DIP客户全景地图V2.html';
 const CAL_SYNC_CACHE = join(__dirname, 'calendar_sync.json');
 const CAL_RESULT = join(__dirname, 'calendar_sync_result.json');
@@ -23,7 +31,11 @@ const REMOTE_DATA = process.env.WORKMEMO_REMOTE_DATA === '1';
 const DATA_FILE = process.env.WORKMEMO_DATA_FILE || join(__dirname, 'workmemo-data.json');
 const DATA_BACKUP_DIR = join(dirname(DATA_FILE), 'workmemo-data-history');
 const DATA_STORES = ['dailyPlans', 'workLogs', 'schedules', 'memos', 'versions', 'settings', 'projects', 'workItems', 'files', 'reports', 'leadSheets'];
-let dataCache = null;
+function dataFileForSpace(space) {
+  if (space === 'default' && process.env.WORKMEMO_DATA_FILE) return DATA_FILE;
+  const safe = createHash('sha256').update(String(space)).digest('hex').slice(0, 24);
+  return join(dirname(DATA_FILE), 'workmemo-data-' + safe + '.json');
+}
 
 function lanIps() {
   const out = [];
@@ -79,16 +91,23 @@ const MIME = {
   '.ico': 'image/x-icon',
 };
 
-function sessionToken() {
-  return createHmac('sha256', SESSION_SECRET).update(ACCESS_CODE).digest('hex');
+function sessionToken(code, space) {
+  return createHmac('sha256', SESSION_SECRET).update(String(code) + '|' + String(space)).digest('hex');
 }
-function hasSession(req) {
+function sessionInfo(req) {
   const header = String(req.headers.cookie || '');
   const match = header.match(/(?:^|;\s*)wm_session=([^;]+)/);
-  if (!match) return false;
-  const actual = Buffer.from(decodeURIComponent(match[1]));
-  const expected = Buffer.from(sessionToken());
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
+  if (!match) return null;
+  const raw = decodeURIComponent(match[1]);
+  const sep = raw.indexOf('.');
+  if (sep <= 0) return null;
+  const space = raw.slice(0, sep), sig = raw.slice(sep + 1);
+  for (const [code, mappedSpace] of ACCESS_SPACES) {
+    if (mappedSpace !== space) continue;
+    const actual = Buffer.from(sig), expected = Buffer.from(sessionToken(code, space));
+    if (actual.length === expected.length && timingSafeEqual(actual, expected)) return { code, space };
+  }
+  return null;
 }
 function readJsonBody(req) {
   return (async () => {
@@ -97,35 +116,37 @@ function readJsonBody(req) {
     return JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}');
   })();
 }
-function authCookie(req) {
+function authCookie(req, code, space) {
   const secure = String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https' ? '; Secure' : '';
-  return 'wm_session=' + encodeURIComponent(sessionToken()) + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000' + secure;
+  return 'wm_session=' + encodeURIComponent(String(space) + '.' + sessionToken(code, space)) + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000' + secure;
 }
-async function loadRemoteData() {
-  if (dataCache) return dataCache;
-  try { dataCache = JSON.parse(await readFile(DATA_FILE, 'utf-8')); } catch { dataCache = {}; }
-  for (const store of DATA_STORES) if (!Array.isArray(dataCache[store])) dataCache[store] = [];
-  return dataCache;
+async function loadRemoteData(filePath) {
+  let data;
+  try { data = JSON.parse(await readFile(filePath, 'utf-8')); } catch { data = {}; }
+  for (const store of DATA_STORES) if (!Array.isArray(data[store])) data[store] = [];
+  return data;
 }
-async function saveRemoteData() {
-  const current = await loadRemoteData();
-  await mkdir(DATA_BACKUP_DIR, { recursive: true });
+async function saveRemoteData(filePath, current) {
+  const backupDir = join(dirname(filePath), 'workmemo-data-history');
+  await mkdir(backupDir, { recursive: true });
   try {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    await copyFile(DATA_FILE, join(DATA_BACKUP_DIR, stamp + '.json'));
+    await copyFile(filePath, join(backupDir, stamp + '.json'));
   } catch { /* first save has no prior snapshot */ }
-  const tmp = DATA_FILE + '.tmp';
+  await mkdir(dirname(filePath), { recursive: true });
+  const tmp = filePath + '.tmp';
   await writeFile(tmp, JSON.stringify(current, null, 2), 'utf-8');
   const { rename } = await import('node:fs/promises');
-  await rename(tmp, DATA_FILE);
+  await rename(tmp, filePath);
 }
 function remoteStoreKey(store, row) { return store === 'settings' || store === 'leadSheets' ? row.key : row.id; }
 function nextRemoteId(rows) { return rows.reduce((m, x) => Math.max(m, Number(x.id) || 0), 0) + 1; }
-async function handleRemoteDb(req, res, url) {
+async function handleRemoteDb(req, res, url, space) {
   const match = url.pathname.match(/^\/api\/db\/([^/]+)(?:\/([^/]+))?$/);
   if (!match || !DATA_STORES.includes(match[1])) return false;
   const store = match[1], idRaw = match[2];
-  const data = await loadRemoteData();
+  const dataFile = dataFileForSpace(space);
+  const data = await loadRemoteData(dataFile);
   const rows = data[store];
   const id = idRaw === undefined ? undefined : (store === 'settings' || store === 'leadSheets' ? decodeURIComponent(idRaw) : Number(idRaw));
   const send = (code, payload) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(payload)); return true; };
@@ -151,13 +172,13 @@ async function handleRemoteDb(req, res, url) {
     const idx = rows.findIndex(x => remoteStoreKey(store, x) === key);
     if (req.method === 'POST' && idx >= 0) return send(409, { error: 'already exists' });
     if (idx >= 0) rows[idx] = row; else rows.push(row);
-    await saveRemoteData();
+    await saveRemoteData(dataFile, data);
     return send(200, row);
   }
   if (req.method === 'DELETE') {
     const idx = rows.findIndex(x => remoteStoreKey(store, x) === id);
     if (idx >= 0) rows.splice(idx, 1);
-    await saveRemoteData();
+    await saveRemoteData(dataFile, data);
     return send(200, { ok: true });
   }
   send(405, { error: 'method not allowed' });
@@ -170,17 +191,19 @@ const server = createServer(async (req, res) => {
   // ---- 访问代码登录（Node 公网部署时保护 API；静态 GitHub Pages 会自动退回前端轻量确认） ----
   if (url.pathname === '/api/auth/status' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-    return res.end(JSON.stringify({ authenticated: hasSession(req) }));
+    const session = sessionInfo(req);
+    return res.end(JSON.stringify({ authenticated: !!session, space: session ? session.space : null }));
   }
   if (url.pathname === '/api/auth/login' && req.method === 'POST') {
     try {
       const body = await readJsonBody(req);
-      if (String(body.code || '') !== ACCESS_CODE) {
+      const code = String(body.code || ''), space = ACCESS_SPACES.get(code);
+      if (!space) {
         res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
         return res.end(JSON.stringify({ ok: false, error: 'INVALID_CODE' }));
       }
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Set-Cookie': authCookie(req) });
-      return res.end(JSON.stringify({ ok: true }));
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Set-Cookie': authCookie(req, code, space) });
+      return res.end(JSON.stringify({ ok: true, space }));
     } catch (e) {
       res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
       return res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -194,12 +217,13 @@ const server = createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify({ remoteData: REMOTE_DATA }));
   }
-  if ((url.pathname.startsWith('/api/') || url.pathname.startsWith('/ai/')) && !hasSession(req)) {
+  const session = sessionInfo(req);
+  if ((url.pathname.startsWith('/api/') || url.pathname.startsWith('/ai/')) && !session) {
     res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify({ ok: false, error: 'AUTH_REQUIRED' }));
   }
   if (REMOTE_DATA && url.pathname.startsWith('/api/db/')) {
-    if (await handleRemoteDb(req, res, url)) return;
+    if (await handleRemoteDb(req, res, url, session.space)) return;
   }
 
   // ---- AI Proxy: /ai/* → https://aicoding.wenge.com/v1/* ----

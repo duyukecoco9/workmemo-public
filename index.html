@@ -148,6 +148,7 @@ body { background: #f1f5f9; margin: 0; overflow: hidden; }
 <script>
 // ===================== Database =====================
 const DB_NAME = 'WorkMemoDB';
+let WORKMEMO_ACTIVE_SCOPE = 'default';
 
 async function encodeRemoteValue(value) {
   if (typeof Blob !== 'undefined' && value instanceof Blob) {
@@ -182,7 +183,7 @@ function decodeRemoteValue(value) {
 
 class Database {
   constructor() { this.db = null; this.fallback = false; this.remote = false; this.fallbackData = {}; }
-  _fallbackKey() { return 'WorkMemoDB:file-fallback:v1'; }
+  _fallbackKey() { return 'WorkMemoDB:file-fallback:v1:' + (WORKMEMO_ACTIVE_SCOPE || 'default'); }
   _fallbackLoad() {
     try {
       const raw = localStorage.getItem(this._fallbackKey());
@@ -4279,8 +4280,15 @@ async function unlockWorkMemo() {
         if (error) error.textContent = '服务端未接受访问代码';
         return;
       }
+      if (resp.ok) {
+        const auth = await resp.json().catch(() => ({}));
+        WORKMEMO_ACTIVE_SCOPE = auth.space || 'default';
+      } else {
+        WORKMEMO_ACTIVE_SCOPE = 'code-' + input.value;
+      }
     } catch (_) { /* 静态托管无 API 时退回本地确认 */ }
   }
+  try { localStorage.setItem('wm_active_scope', WORKMEMO_ACTIVE_SCOPE); } catch (_) {}
   try { localStorage.setItem('wm_access_granted', '1'); } catch (_) {}
   const gate = document.getElementById('accessGate');
   if (gate) gate.remove();
@@ -4290,6 +4298,7 @@ async function unlockWorkMemo() {
 // Init：Node 服务端会话失效时重新要求代码；静态托管按本机确认状态进入。
 async function bootWorkMemo() {
   let accessGranted = false;
+  try { WORKMEMO_ACTIVE_SCOPE = localStorage.getItem('wm_active_scope') || 'default'; } catch (_) {}
   try { accessGranted = localStorage.getItem('wm_access_granted') === '1'; } catch (_) {}
   if (accessGranted && /^https?:$/.test(location.protocol)) {
     try {
@@ -4297,6 +4306,10 @@ async function bootWorkMemo() {
       if (resp.ok) {
         const state = await resp.json();
         if (state && state.authenticated === false) accessGranted = false;
+        if (state && state.authenticated && state.space) {
+          WORKMEMO_ACTIVE_SCOPE = state.space;
+          try { localStorage.setItem('wm_active_scope', WORKMEMO_ACTIVE_SCOPE); } catch (_) {}
+        }
       }
     } catch (_) { /* 静态托管没有鉴权 API */ }
   }
