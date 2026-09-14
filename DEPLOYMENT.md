@@ -7,7 +7,7 @@
 3. 设置环境变量 `WORKMEMO_ACCESS_CODE=workmemo`，并为 `WORKMEMO_SESSION_SECRET` 设置一段随机长字符串。
 4. 部署完成后，Render 会提供 `https://xxxxx.onrender.com` 地址；该地址同时支持页面、服务端访问代码会话和 `/ai/` 代理。
 
-注意：Render 免费实例可能休眠，且本地文件系统不适合作为长期数据盘。当前 WorkMemo 的记录默认仍在浏览器 IndexedDB；若需要跨设备实时共享数据，需要下一步启用服务端数据库/持久磁盘。
+`render.yaml` 已启用远程数据模式并挂载 1GB 持久磁盘。该形态会把项目、事项、备忘、版本和附件统一保存在服务器 JSON 数据文件中，并在每次写入前生成历史快照，因此不同设备登录后看到同一份数据。Render 持久磁盘通常需要付费 Starter 实例，创建服务前请在 Render 页面核对价格。
 
 ## 推荐形态
 

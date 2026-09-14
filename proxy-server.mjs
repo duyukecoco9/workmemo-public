@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, copyFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import os from 'node:os';
@@ -19,6 +19,11 @@ const JXA_SYNC = join(__dirname, 'calendar_sync.jxa.js');
 const JXA_STATUS = join(__dirname, 'calendar_status.jxa.js');
 const CAL_BIN = join(__dirname, 'CalendarSync.app/Contents/MacOS/CalendarSync');
 const CAL_APP = join(__dirname, 'CalendarSync.app');
+const REMOTE_DATA = process.env.WORKMEMO_REMOTE_DATA === '1';
+const DATA_FILE = process.env.WORKMEMO_DATA_FILE || join(__dirname, 'workmemo-data.json');
+const DATA_BACKUP_DIR = join(dirname(DATA_FILE), 'workmemo-data-history');
+const DATA_STORES = ['dailyPlans', 'workLogs', 'schedules', 'memos', 'versions', 'settings', 'projects', 'workItems', 'files', 'reports', 'leadSheets'];
+let dataCache = null;
 
 function lanIps() {
   const out = [];
@@ -96,6 +101,68 @@ function authCookie(req) {
   const secure = String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https' ? '; Secure' : '';
   return 'wm_session=' + encodeURIComponent(sessionToken()) + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000' + secure;
 }
+async function loadRemoteData() {
+  if (dataCache) return dataCache;
+  try { dataCache = JSON.parse(await readFile(DATA_FILE, 'utf-8')); } catch { dataCache = {}; }
+  for (const store of DATA_STORES) if (!Array.isArray(dataCache[store])) dataCache[store] = [];
+  return dataCache;
+}
+async function saveRemoteData() {
+  const current = await loadRemoteData();
+  await mkdir(DATA_BACKUP_DIR, { recursive: true });
+  try {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    await copyFile(DATA_FILE, join(DATA_BACKUP_DIR, stamp + '.json'));
+  } catch { /* first save has no prior snapshot */ }
+  const tmp = DATA_FILE + '.tmp';
+  await writeFile(tmp, JSON.stringify(current, null, 2), 'utf-8');
+  const { rename } = await import('node:fs/promises');
+  await rename(tmp, DATA_FILE);
+}
+function remoteStoreKey(store, row) { return store === 'settings' || store === 'leadSheets' ? row.key : row.id; }
+function nextRemoteId(rows) { return rows.reduce((m, x) => Math.max(m, Number(x.id) || 0), 0) + 1; }
+async function handleRemoteDb(req, res, url) {
+  const match = url.pathname.match(/^\/api\/db\/([^/]+)(?:\/([^/]+))?$/);
+  if (!match || !DATA_STORES.includes(match[1])) return false;
+  const store = match[1], idRaw = match[2];
+  const data = await loadRemoteData();
+  const rows = data[store];
+  const id = idRaw === undefined ? undefined : (store === 'settings' || store === 'leadSheets' ? decodeURIComponent(idRaw) : Number(idRaw));
+  const send = (code, payload) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(payload)); return true; };
+  if (req.method === 'GET') {
+    if (id === undefined) {
+      const index = url.searchParams.get('index');
+      if (!index) return send(200, rows);
+      let query; try { query = JSON.parse(url.searchParams.get('query') || 'null'); } catch { query = null; }
+      const matched = rows.filter(row => {
+        if (index === 'entityType_entityId') return JSON.stringify([row.entityType, row.entityId]) === JSON.stringify(query);
+        return row[index] === query;
+      });
+      return send(200, matched);
+    }
+    return send(200, rows.find(row => remoteStoreKey(store, row) === id) || null);
+  }
+  if (req.method === 'POST' || req.method === 'PUT') {
+    const body = await readJsonBody(req);
+    const row = body && typeof body === 'object' ? body : {};
+    if (store !== 'settings' && store !== 'leadSheets' && row.id == null) row.id = nextRemoteId(rows);
+    const key = remoteStoreKey(store, row);
+    if (key == null) return send(400, { error: 'missing key/id' });
+    const idx = rows.findIndex(x => remoteStoreKey(store, x) === key);
+    if (req.method === 'POST' && idx >= 0) return send(409, { error: 'already exists' });
+    if (idx >= 0) rows[idx] = row; else rows.push(row);
+    await saveRemoteData();
+    return send(200, row);
+  }
+  if (req.method === 'DELETE') {
+    const idx = rows.findIndex(x => remoteStoreKey(store, x) === id);
+    if (idx >= 0) rows.splice(idx, 1);
+    await saveRemoteData();
+    return send(200, { ok: true });
+  }
+  send(405, { error: 'method not allowed' });
+  return true;
+}
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
@@ -123,9 +190,16 @@ const server = createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Set-Cookie': 'wm_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' });
     return res.end(JSON.stringify({ ok: true }));
   }
+  if (url.pathname === '/api/runtime' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify({ remoteData: REMOTE_DATA }));
+  }
   if ((url.pathname.startsWith('/api/') || url.pathname.startsWith('/ai/')) && !hasSession(req)) {
     res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify({ ok: false, error: 'AUTH_REQUIRED' }));
+  }
+  if (REMOTE_DATA && url.pathname.startsWith('/api/db/')) {
+    if (await handleRemoteDb(req, res, url)) return;
   }
 
   // ---- AI Proxy: /ai/* → https://aicoding.wenge.com/v1/* ----

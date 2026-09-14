@@ -149,8 +149,39 @@ body { background: #f1f5f9; margin: 0; overflow: hidden; }
 // ===================== Database =====================
 const DB_NAME = 'WorkMemoDB';
 
+async function encodeRemoteValue(value) {
+  if (typeof Blob !== 'undefined' && value instanceof Blob) {
+    const bytes = new Uint8Array(await value.arrayBuffer());
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    return { __workmemoBlob: true, type: value.type || 'application/octet-stream', base64: btoa(binary) };
+  }
+  if (Array.isArray(value)) return Promise.all(value.map(encodeRemoteValue));
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = await encodeRemoteValue(v);
+    return out;
+  }
+  return value;
+}
+function decodeRemoteValue(value) {
+  if (Array.isArray(value)) return value.map(decodeRemoteValue);
+  if (value && typeof value === 'object') {
+    if (value.__workmemoBlob && value.base64) {
+      const binary = atob(value.base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return new Blob([bytes], { type: value.type || 'application/octet-stream' });
+    }
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = decodeRemoteValue(v);
+    return out;
+  }
+  return value;
+}
+
 class Database {
-  constructor() { this.db = null; this.fallback = false; this.fallbackData = {}; }
+  constructor() { this.db = null; this.fallback = false; this.remote = false; this.fallbackData = {}; }
   _fallbackKey() { return 'WorkMemoDB:file-fallback:v1'; }
   _fallbackLoad() {
     try {
@@ -165,6 +196,12 @@ class Database {
     try { localStorage.setItem(this._fallbackKey(), JSON.stringify(this.fallbackData)); } catch (_) { /* file:// 存储被浏览器禁用时退化为内存模式 */ }
   }
   async init() {
+    if (/^https?:$/.test(location.protocol)) {
+      try {
+        const runtime = await fetch('/api/runtime', { cache: 'no-store' }).then(r => r.ok ? r.json() : null);
+        if (runtime && runtime.remoteData) { this.remote = true; return; }
+      } catch (_) { /* 静态托管或本地服务未提供远程数据模式 */ }
+    }
     // Chrome/Edge 对 file:// 页面可能拒绝 IndexedDB；直接打开 HTML 时使用本地兼容层，避免白屏。
     if (location.protocol === 'file:' || typeof indexedDB === 'undefined') {
       this.fallback = true;
@@ -221,16 +258,22 @@ class Database {
   }
   _store(name, mode) { return this.db.transaction(name, mode).objectStore(name); }
   async getAll(store) {
+    if (this.remote) return fetch('/api/db/' + encodeURIComponent(store), { credentials: 'same-origin' }).then(r => { if (!r.ok) throw new Error('远程数据读取失败'); return r.json(); }).then(decodeRemoteValue);
     if (this.fallback) return (this.fallbackData[store] || []).map(x => JSON.parse(JSON.stringify(x)));
     return new Promise((res, rej) => { const r = this._store(store, 'readonly').getAll(); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
   }
   async get(store, id) {
+    if (this.remote) return fetch('/api/db/' + encodeURIComponent(store) + '/' + encodeURIComponent(id), { credentials: 'same-origin' }).then(r => { if (!r.ok) throw new Error('远程数据读取失败'); return r.json(); }).then(decodeRemoteValue);
     if (this.fallback) { const row = (this.fallbackData[store] || []).find(x => x.id === id || x.key === id); return row ? JSON.parse(JSON.stringify(row)) : undefined; }
     return new Promise((res, rej) => { const r = this._store(store, 'readonly').get(id); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
   }
   async add(store, data) {
     data.createdAt = data.createdAt || new Date().toISOString();
     data.updatedAt = new Date().toISOString();
+    if (this.remote) {
+      const encoded = await encodeRemoteValue(data);
+      return fetch('/api/db/' + encodeURIComponent(store), { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(encoded) }).then(r => { if (!r.ok) throw new Error('远程数据写入失败'); return r.json(); }).then(row => row.id != null ? row.id : row.key);
+    }
     if (this.fallback) {
       const row = JSON.parse(JSON.stringify(data, (k, v) => k === 'blob' ? undefined : v));
       if (row.id == null && store !== 'settings' && store !== 'leadSheets') row.id = (this.fallbackData[store] || []).reduce((m, x) => Math.max(m, Number(x.id) || 0), 0) + 1;
@@ -243,6 +286,10 @@ class Database {
   }
   async put(store, data) {
     data.updatedAt = new Date().toISOString();
+    if (this.remote) {
+      const encoded = await encodeRemoteValue(data);
+      return fetch('/api/db/' + encodeURIComponent(store) + '/' + encodeURIComponent(store === 'settings' || store === 'leadSheets' ? data.key : data.id), { method: 'PUT', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(encoded) }).then(r => { if (!r.ok) throw new Error('远程数据写入失败'); return r.json(); }).then(row => row.id != null ? row.id : row.key);
+    }
     if (this.fallback) {
       const row = JSON.parse(JSON.stringify(data, (k, v) => k === 'blob' ? undefined : v));
       const key = store === 'settings' || store === 'leadSheets' ? row.key : row.id;
@@ -256,6 +303,7 @@ class Database {
     return new Promise((res, rej) => { const r = this._store(store, 'readwrite').put(data); r.onsuccess = () => { try { app._dataDirty = true; } catch(_) {} res(r.result); }; r.onerror = () => rej(r.error); });
   }
   async delete(store, id) {
+    if (this.remote) return fetch('/api/db/' + encodeURIComponent(store) + '/' + encodeURIComponent(id), { method: 'DELETE', credentials: 'same-origin' }).then(r => { if (!r.ok) throw new Error('远程数据删除失败'); });
     if (this.fallback) {
       const list = this.fallbackData[store] || [];
       this.fallbackData[store] = list.filter(x => (store === 'settings' || store === 'leadSheets' ? x.key : x.id) !== id);
@@ -266,6 +314,7 @@ class Database {
     return new Promise((res, rej) => { const r = this._store(store, 'readwrite').delete(id); r.onsuccess = () => { try { app._dataDirty = true; } catch(_) {} res(); }; r.onerror = () => rej(r.error); });
   }
   async getByIndex(store, indexName, query) {
+    if (this.remote) return fetch('/api/db/' + encodeURIComponent(store) + '?index=' + encodeURIComponent(indexName) + '&query=' + encodeURIComponent(JSON.stringify(query)), { credentials: 'same-origin' }).then(r => { if (!r.ok) throw new Error('远程数据读取失败'); return r.json(); }).then(decodeRemoteValue);
     if (this.fallback) {
       const field = indexName === 'entityType_entityId' ? ['entityType', 'entityId'] : [indexName];
       return (this.fallbackData[store] || []).filter(row => {
