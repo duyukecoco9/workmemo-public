@@ -4267,26 +4267,31 @@ const WORKMEMO_ACCESS_CODE = 'workmemo';
 async function unlockWorkMemo() {
   const input = document.getElementById('accessCode');
   const error = document.getElementById('accessError');
-  if (!input || input.value !== WORKMEMO_ACCESS_CODE) {
-    if (error) error.textContent = '访问代码不正确';
-    if (input) { input.value = ''; input.focus(); }
-    return;
-  }
+  if (!input || !input.value) return;
+  let serverAuth = false, staticHosting = location.protocol === 'file:';
   // Node 公网部署会在服务端签发 HttpOnly 会话；GitHub Pages 等静态托管没有此接口时继续使用本地确认。
   if (/^https?:$/.test(location.protocol)) {
     try {
       const resp = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: input.value }) });
-      if (resp.status !== 404 && resp.status !== 405 && !resp.ok) {
+      staticHosting = resp.status === 404 || resp.status === 405;
+      if (!staticHosting && !resp.ok) {
         if (error) error.textContent = '服务端未接受访问代码';
         return;
       }
       if (resp.ok) {
+        serverAuth = true;
         const auth = await resp.json().catch(() => ({}));
         WORKMEMO_ACTIVE_SCOPE = auth.space || 'default';
-      } else {
-        WORKMEMO_ACTIVE_SCOPE = 'code-' + input.value;
       }
-    } catch (_) { /* 静态托管无 API 时退回本地确认 */ }
+    } catch (_) { staticHosting = true; }
+  }
+  if (!serverAuth && staticHosting) {
+    if (input.value !== WORKMEMO_ACCESS_CODE) {
+      if (error) error.textContent = '访问代码不正确';
+      input.value = ''; input.focus();
+      return;
+    }
+    WORKMEMO_ACTIVE_SCOPE = 'code-' + input.value;
   }
   try { localStorage.setItem('wm_active_scope', WORKMEMO_ACTIVE_SCOPE); } catch (_) {}
   try { localStorage.setItem('wm_access_granted', '1'); } catch (_) {}
