@@ -1,0 +1,11 @@
+{
+  "name": "workmemo",
+  "version": "3.0.0",
+  "private": true,
+  "description": "WorkMemo 个人工作管理助手（项目泳道 + 日程日历）",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "dev": "node proxy-server.mjs",
+    "start": "node proxy-server.mjs"
+  }
+}
