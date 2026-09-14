@@ -1,5 +1,14 @@
 # WorkMemo 公网部署规划
 
+## 一键部署到 Render（推荐用于运行 Node 服务）
+
+1. 在 Render 登录并连接 GitHub 仓库 `duyukecoco9/workmemo-public`。
+2. 选择仓库中的 `render.yaml` 创建 Web Service。
+3. 设置环境变量 `WORKMEMO_ACCESS_CODE=workmemo`，并为 `WORKMEMO_SESSION_SECRET` 设置一段随机长字符串。
+4. 部署完成后，Render 会提供 `https://xxxxx.onrender.com` 地址；该地址同时支持页面、服务端访问代码会话和 `/ai/` 代理。
+
+注意：Render 免费实例可能休眠，且本地文件系统不适合作为长期数据盘。当前 WorkMemo 的记录默认仍在浏览器 IndexedDB；若需要跨设备实时共享数据，需要下一步启用服务端数据库/持久磁盘。
+
 ## 推荐形态
 
 WorkMemo 当前是“浏览器本地优先”应用：数据和 API Key 在浏览器 IndexedDB，不在服务端数据库。最省改动的公网形态是 **一台长期运行的 Node.js 服务 + Caddy/Nginx HTTPS 反向代理 + 一层访问保护**。这样可以同时提供 v3 页面、`/ai/*` 同源 AI 中转和 `/workmemo.ics` 订阅。

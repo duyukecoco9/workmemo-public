@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: workmemo
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: WORKMEMO_ACCESS_CODE
+        sync: false
+      - key: WORKMEMO_SESSION_SECRET
+        sync: false
+      - key: AI_TARGET
+        value: https://api.moonshot.cn/v1
