@@ -4275,7 +4275,7 @@ async function unlockWorkMemo() {
   if (/^https?:$/.test(location.protocol)) {
     try {
       const resp = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: input.value }) });
-      if (resp.status !== 404 && !resp.ok) {
+      if (resp.status !== 404 && resp.status !== 405 && !resp.ok) {
         if (error) error.textContent = '服务端未接受访问代码';
         return;
       }
