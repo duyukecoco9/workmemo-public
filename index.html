@@ -329,6 +329,7 @@ class Database {
     return this.add('versions', { entityType, entityId, data: JSON.parse(JSON.stringify(data)), action: action || 'edit', createdAt: new Date().toISOString() });
   }
   async getVersions(entityType, entityId) {
+    if (this.remote) return this.getByIndex('versions', 'entityType_entityId', [entityType, entityId]);
     return this.getByIndex('versions', 'entityType_entityId', IDBKeyRange.only([entityType, entityId]));
   }
   async getSetting(key, defaultValue) {
