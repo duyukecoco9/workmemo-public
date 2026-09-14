@@ -4222,22 +4222,44 @@ async function unlockWorkMemo() {
     if (input) { input.value = ''; input.focus(); }
     return;
   }
+  // Node 公网部署会在服务端签发 HttpOnly 会话；GitHub Pages 等静态托管没有此接口时继续使用本地确认。
+  if (/^https?:$/.test(location.protocol)) {
+    try {
+      const resp = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: input.value }) });
+      if (resp.status !== 404 && !resp.ok) {
+        if (error) error.textContent = '服务端未接受访问代码';
+        return;
+      }
+    } catch (_) { /* 静态托管无 API 时退回本地确认 */ }
+  }
   try { localStorage.setItem('wm_access_granted', '1'); } catch (_) {}
   const gate = document.getElementById('accessGate');
   if (gate) gate.remove();
   await app.init();
 }
 
-// Init：已在此设备确认过则直接进入，否则显示访问代码输入框
-let accessGranted = false;
-try { accessGranted = localStorage.getItem('wm_access_granted') === '1'; } catch (_) {}
-if (accessGranted) {
-  const gate = document.getElementById('accessGate');
-  if (gate) gate.remove();
-  app.init();
-} else {
-  setTimeout(() => { const input = document.getElementById('accessCode'); if (input) input.focus(); }, 0);
+// Init：Node 服务端会话失效时重新要求代码；静态托管按本机确认状态进入。
+async function bootWorkMemo() {
+  let accessGranted = false;
+  try { accessGranted = localStorage.getItem('wm_access_granted') === '1'; } catch (_) {}
+  if (accessGranted && /^https?:$/.test(location.protocol)) {
+    try {
+      const resp = await fetch('/api/auth/status', { cache: 'no-store' });
+      if (resp.ok) {
+        const state = await resp.json();
+        if (state && state.authenticated === false) accessGranted = false;
+      }
+    } catch (_) { /* 静态托管没有鉴权 API */ }
+  }
+  if (accessGranted) {
+    const gate = document.getElementById('accessGate');
+    if (gate) gate.remove();
+    app.init();
+  } else {
+    setTimeout(() => { const input = document.getElementById('accessCode'); if (input) input.focus(); }, 0);
+  }
 }
+bootWorkMemo();
 </script>
 </body>
 </html>

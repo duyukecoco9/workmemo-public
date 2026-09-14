@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { readFile, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import os from 'node:os';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,6 +10,8 @@ import { dirname } from 'node:path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 8848;
 const AI_TARGET = (process.env.AI_TARGET || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
+const ACCESS_CODE = process.env.WORKMEMO_ACCESS_CODE || 'workmemo';
+const SESSION_SECRET = process.env.WORKMEMO_SESSION_SECRET || 'workmemo-session:' + ACCESS_CODE;
 const PANORAMA_PATH = process.env.PANORAMA_PATH || '/Users/julianhuang/Documents/Kimi/Workspaces/DIP/DIP客户全景地图V2.html';
 const CAL_SYNC_CACHE = join(__dirname, 'calendar_sync.json');
 const CAL_RESULT = join(__dirname, 'calendar_sync_result.json');
@@ -71,8 +74,59 @@ const MIME = {
   '.ico': 'image/x-icon',
 };
 
+function sessionToken() {
+  return createHmac('sha256', SESSION_SECRET).update(ACCESS_CODE).digest('hex');
+}
+function hasSession(req) {
+  const header = String(req.headers.cookie || '');
+  const match = header.match(/(?:^|;\s*)wm_session=([^;]+)/);
+  if (!match) return false;
+  const actual = Buffer.from(decodeURIComponent(match[1]));
+  const expected = Buffer.from(sessionToken());
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+function readJsonBody(req) {
+  return (async () => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    return JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}');
+  })();
+}
+function authCookie(req) {
+  const secure = String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https' ? '; Secure' : '';
+  return 'wm_session=' + encodeURIComponent(sessionToken()) + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000' + secure;
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  // ---- 访问代码登录（Node 公网部署时保护 API；静态 GitHub Pages 会自动退回前端轻量确认） ----
+  if (url.pathname === '/api/auth/status' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify({ authenticated: hasSession(req) }));
+  }
+  if (url.pathname === '/api/auth/login' && req.method === 'POST') {
+    try {
+      const body = await readJsonBody(req);
+      if (String(body.code || '') !== ACCESS_CODE) {
+        res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        return res.end(JSON.stringify({ ok: false, error: 'INVALID_CODE' }));
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Set-Cookie': authCookie(req) });
+      return res.end(JSON.stringify({ ok: true }));
+    } catch (e) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+  }
+  if (url.pathname === '/api/auth/logout' && req.method === 'POST') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Set-Cookie': 'wm_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' });
+    return res.end(JSON.stringify({ ok: true }));
+  }
+  if ((url.pathname.startsWith('/api/') || url.pathname.startsWith('/ai/')) && !hasSession(req)) {
+    res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify({ ok: false, error: 'AUTH_REQUIRED' }));
+  }
 
   // ---- AI Proxy: /ai/* → https://aicoding.wenge.com/v1/* ----
   if (url.pathname.startsWith('/ai/')) {
