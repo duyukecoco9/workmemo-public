@@ -1,5 +1,9 @@
 # WorkMemo 公网部署说明
 
+公网演示地址：https://duyukecoco9.github.io/workmemo-public/
+
+首次在某台设备打开时需要输入访问代码：`workmemo`。这是轻量访问确认；如果要保护真实数据，请使用带服务端鉴权的 Node 部署，并在反向代理层启用 HTTPS + Basic Auth/Cloudflare Access。
+
 ## 包含内容
 
 | 文件 | 作用 | 公网必需 |
